@@ -1,0 +1,289 @@
+"""
+IP Camera + YOLOv5 Person 3D Tracking (threaded RTSP)
+- Uses threaded RTSP reader (auto-reconnect)
+- Detects any person with YOLOv5 and estimates 3D position using bounding-box height
+- Auto-lock on closest person (or manual 'm' lock)
+- Press 'q' to quit
+"""
+
+import time
+import threading
+from datetime import datetime
+from urllib.parse import quote_plus
+
+import cv2
+import numpy as np
+import torch
+
+# ---------------------------
+# CONFIG (EDIT THESE VALUES)
+# ---------------------------
+CAM_IP = "192.168.31.68"
+USERNAME = "admin"
+PASSWORD = "Mypassword@25"
+
+FOCAL_LENGTH = 388.0         # in pixels - calibrate per camera
+REAL_PERSON_HEIGHT = 1.7     # meters - average person height (adjust if needed)
+DESIRED_WIDTH = 640
+DESIRED_HEIGHT = 480
+CONF_THRESHOLD = 0.45        # detection confidence threshold
+LOCK_DISTANCE_THRESHOLD = 2.0  # meters to auto-lock
+DIRECTION_THRESHOLD = 0.2    # meters threshold to show movement arrows
+# ---------------------------
+
+
+def build_rtsp_urls(ip, user, password):
+    """Try multiple common camera URL patterns (credentials are URL-encoded)."""
+    u = quote_plus(user)
+    p = quote_plus(password)
+    return [
+        f"rtsp://{u}:{p}@{ip}:554/Streaming/Channels/101",
+        f"rtsp://{u}:{p}@{ip}:554/stream1",
+        f"rtsp://{u}:{p}@{ip}:554/h264",
+        f"rtsp://{u}:{p}@{ip}:554/ch0_0.264",
+        f"rtsp://{u}:{p}@{ip}/cam/realmonitor?channel=1&subtype=0",
+        f"rtsp://{u}:{p}@{ip}:554/onvif1",
+        f"http://{u}:{p}@{ip}/video",
+        f"http://{u}:{p}@{ip}:8080/video",
+    ]
+
+
+class ThreadedIPCam:
+    """Threaded RTSP/IP camera reader with auto-reconnect."""
+
+    def __init__(self, url_candidates, reconnect_delay=5.0):
+        self.url_candidates = url_candidates
+        self.reconnect_delay = reconnect_delay
+        self.capture = None
+        self.frame = None
+        self.lock = threading.Lock()
+        self.stopped = True
+        self.current_url = None
+
+    def _try_open(self, url, timeout=5.0):
+        cap = cv2.VideoCapture(url)
+        if not cap.isOpened():
+            return None
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                # set desired resolution if possible
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, DESIRED_WIDTH)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DESIRED_HEIGHT)
+                return cap
+            time.sleep(0.2)
+        cap.release()
+        return None
+
+    def _connect(self):
+        for url in self.url_candidates:
+            print(f"[{datetime.now()}] Trying URL: {url}")
+            cap = self._try_open(url)
+            if cap:
+                print(f"[{datetime.now()}] Connected to {url}")
+                self.current_url = url
+                return cap
+        return None
+
+    def start(self):
+        self.stopped = False
+        threading.Thread(target=self._update, daemon=True).start()
+        return self
+
+    def _update(self):
+        while not self.stopped:
+            if self.capture is None:
+                cap = self._connect()
+                if cap is None:
+                    print(f"[{datetime.now()}] No URL worked — retrying in {self.reconnect_delay}s")
+                    time.sleep(self.reconnect_delay)
+                    continue
+                else:
+                    self.capture = cap
+
+            ret, frame = self.capture.read()
+            if not ret or frame is None:
+                try:
+                    self.capture.release()
+                except Exception:
+                    pass
+                self.capture = None
+                print(f"[{datetime.now()}] Lost stream, reconnecting...")
+                time.sleep(self.reconnect_delay)
+                continue
+
+            with self.lock:
+                self.frame = frame
+
+            # tiny sleep so this loop is not 100% CPU
+            time.sleep(0.002)
+
+    def read(self):
+        with self.lock:
+            return None if self.frame is None else self.frame.copy()
+
+    def stop(self):
+        self.stopped = True
+        try:
+            if self.capture:
+                self.capture.release()
+        except Exception:
+            pass
+
+
+# ---------------------------
+# Load YOLOv5 model (ultralytics via torch.hub)
+# ---------------------------
+print("[INFO] Loading YOLOv5 model...")
+try:
+    model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+    model.classes = [0]  # only person class
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model.to(device)
+    print(f"[INFO] Model loaded on device: {device}")
+except Exception as e:
+    print("[ERROR] Failed to load model. Make sure torch and internet access (for first download) are available.")
+    raise
+
+# ---------------------------
+# helper utilities
+# ---------------------------
+def draw_direction_window(dx, dy, dz):
+    img = np.zeros((200, 200, 3), dtype=np.uint8)
+    # vertical arrow for Z (closer / farther)
+    if dz < -DIRECTION_THRESHOLD:
+        cv2.arrowedLine(img, (100, 100), (100, 40), (255, 255, 255), 4)
+    elif dz > DIRECTION_THRESHOLD:
+        cv2.arrowedLine(img, (100, 100), (100, 160), (255, 255, 255), 4)
+    # left/right for X
+    if dx < -DIRECTION_THRESHOLD:
+        cv2.arrowedLine(img, (100, 100), (40, 100), (255, 255, 255), 4)
+    elif dx > DIRECTION_THRESHOLD:
+        cv2.arrowedLine(img, (100, 100), (160, 100), (255, 255, 255), 4)
+    # up/down for Y
+    if dy < -DIRECTION_THRESHOLD:
+        cv2.arrowedLine(img, (100, 100), (60, 60), (255, 255, 255), 4)
+    elif dy > DIRECTION_THRESHOLD:
+        cv2.arrowedLine(img, (100, 100), (140, 140), (255, 255, 255), 4)
+
+    # small text if no significant movement
+    if np.count_nonzero(img) == 0:
+        cv2.putText(img, "Stationary", (30, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    return img
+
+
+# ---------------------------
+# MAIN
+# ---------------------------
+if __name__ == "__main__":
+    urls = build_rtsp_urls(CAM_IP, USERNAME, PASSWORD)
+    stream = ThreadedIPCam(urls).start()
+    time.sleep(1.0)  # let thread try to connect
+
+    prev_time = 0.0
+    locked = False
+    initial_position_3d = None
+    dir_window = np.zeros((200, 200, 3), dtype=np.uint8)
+
+    print("Press 'm' to manually lock reference position when a person is detected. Press 'q' to quit.")
+
+    try:
+        while True:
+            frame = stream.read()
+            if frame is None:
+                # no frame yet; wait a bit
+                time.sleep(0.05)
+                continue
+
+            # optionally resize to desired size for inference speed
+            frame_h, frame_w = frame.shape[:2]
+            if (frame_w != DESIRED_WIDTH) or (frame_h != DESIRED_HEIGHT):
+                frame = cv2.resize(frame, (DESIRED_WIDTH, DESIRED_HEIGHT))
+                frame_h, frame_w = frame.shape[:2]
+
+            cx_image_center = frame_w / 2.0
+            cy_image_center = frame_h / 2.0
+
+            # Run YOLOv5 inference (model expects BGR directly when using hub api)
+            results = model(frame, size=640)  # size param controls model input size for speed/accuracy tradeoff
+            detections = results.pandas().xyxy[0]
+
+            # filter person class and confidence
+            persons = detections[(detections['name'] == 'person') & (detections['confidence'] >= CONF_THRESHOLD)]
+
+            current_position_3d = None
+            if not persons.empty:
+                # choose the largest (tallest) bbox => likely closest person
+                persons_list = persons.to_dict('records')
+                persons_list = sorted(persons_list, key=lambda p: (p['ymax'] - p['ymin']), reverse=True)
+                best = persons_list[0]
+
+                x1, y1, x2, y2 = int(best['xmin']), int(best['ymin']), int(best['xmax']), int(best['ymax'])
+                # guard against degenerate boxes
+                height_px = max(1, (y2 - y1))
+                confidence = best['confidence']
+                cx = int((x1 + x2) / 2)
+                cy = int((y1 + y2) / 2)
+
+                # 3D estimation
+                Z = (REAL_PERSON_HEIGHT * FOCAL_LENGTH) / float(height_px)
+                X = ((cx - cx_image_center) * Z) / FOCAL_LENGTH
+                Y = ((cy - cy_image_center) * Z) / FOCAL_LENGTH
+                current_position_3d = (X, Y, Z)
+
+                # draw visuals
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.circle(frame, (cx, cy), 4, (0, 255, 255), -1)
+                cv2.putText(frame, f"Person {confidence:.2f}", (x1, max(0, y1 - 20)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv2.putText(frame, f"Z:{Z:.2f}m", (x1, max(0, y1 - 40)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+                # auto-lock when inside threshold
+                if (not locked) and (Z <= LOCK_DISTANCE_THRESHOLD):
+                    initial_position_3d = current_position_3d
+                    locked = True
+                    print(f"[INFO] Auto-locked person at Z={Z:.2f}m")
+
+                # if locked, compute displacement
+                if locked and initial_position_3d is not None and current_position_3d is not None:
+                    dx = current_position_3d[0] - initial_position_3d[0]
+                    dy = current_position_3d[1] - initial_position_3d[1]
+                    dz = current_position_3d[2] - initial_position_3d[2]
+                    disp_text = f"ΔX:{dx:.2f}m ΔY:{dy:.2f}m ΔZ:{dz:.2f}m"
+                    cv2.putText(frame, disp_text, (10, frame_h - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+                    dir_window = draw_direction_window(dx, dy, dz)
+                else:
+                    dir_window = np.zeros((200, 200, 3), dtype=np.uint8)
+
+            else:
+                dir_window = np.zeros((200, 200, 3), dtype=np.uint8)
+
+            # FPS
+            cur_time = time.time()
+            fps = 1.0 / (cur_time - prev_time) if prev_time else 0.0
+            prev_time = cur_time
+            cv2.putText(frame, f"FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            # show windows
+            cv2.imshow("IP Camera Person 3D Tracking", frame)
+            cv2.imshow("Direction", dir_window)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('m'):
+                if current_position_3d is not None:
+                    initial_position_3d = current_position_3d
+                    locked = True
+                    print(f"[INFO] Manually locked at X={initial_position_3d[0]:.2f}, Y={initial_position_3d[1]:.2f}, Z={initial_position_3d[2]:.2f}")
+
+    except KeyboardInterrupt:
+        print("Interrupted by user.")
+
+    finally:
+        print("Cleaning up...")
+        stream.stop()
+        cv2.destroyAllWindows()
